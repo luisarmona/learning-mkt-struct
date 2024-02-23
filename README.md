@@ -1,4 +1,4 @@
-## LearningMktStruct: A method to learn a latent characteristic space 
+## Learning-Mkt-Struct: A method to learn a latent characteristic space 
 This repository contains the code used to estimate latent product characteristics and consumer preferences from "Learning Product Characteristics and Consumer Preferences from Search Data" by Luis Armona, Greg Lewis, and Giorgos Zervas. The repository contains the actual functions used to construct the model (bpr.py) and a minimum working example on how to estimate the model using Keras (example.py)
 
 

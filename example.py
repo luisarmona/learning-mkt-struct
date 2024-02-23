@@ -6,10 +6,12 @@ import numpy as np
 from keras.callbacks import EarlyStopping
 import matplotlib.pyplot as plt
 import keras.backend as K
+from sklearn.manifold import TSNE
 np.random.seed(9)
 
+
 ###############
-#clean clickstream data to create inequality matrix
+#clean clickstream data to create revealed preference inequality matrix
 
 #from https://archive.ics.uci.edu/dataset/553/clickstream+data+for+online+shopping
 click_df = pd.read_csv('external/e-shop clothing 2008.csv',sep=';')
@@ -26,7 +28,7 @@ num_consumers = click_df['consumer_id'].max()+1
 num_products = click_df['product_id'].max()+1
 
 # create RHS df for inequalities
-neg_df = click_df.groupby('product_id')['price'].mean().reset_index().rename({'product_id':'neg_product_id','price':'neg_price'},axis=1)
+neg_df = click_df.groupby('product_id')['price'].mean().reset_index().rename({'product_id':'neg_product_id'},axis=1).drop('price',axis=1)
 neg_df['1'] = 1 #for many-to-many merge
 
 # construct the inequality matrix.
@@ -35,7 +37,7 @@ ineq_df = []
 print(click_df['consumer_id'].max())
 for b in range(0,click_df['consumer_id'].max(),sessions_per_batch):
     triplet_df = click_df.loc[(click_df['consumer_id']>=b) & (click_df['consumer_id']<b+sessions_per_batch) ,['consumer_id','product_id','price','1']].copy()
-    triplet_df.rename({'product_id':'pos_product_id','price':'pos_price'},axis=1,inplace=True)
+    triplet_df.rename({'product_id':'pos_product_id'},axis=1,inplace=True)
     #construct triplet df
     pos_hotels = {i:j for i,j in triplet_df.groupby('consumer_id')['pos_product_id'].apply(lambda x: set(x)).items()}
     triplet_df['pos_hotel_set'] = triplet_df['consumer_id'].apply(lambda x: pos_hotels[x])
@@ -45,8 +47,7 @@ for b in range(0,click_df['consumer_id'].max(),sessions_per_batch):
     triplet_df = triplet_df.merge(neg_df,on='1',how='inner')
     #throw out inequalities with searched products on LHS
     triplet_df = triplet_df[(triplet_df['pos_hotel_set'] & triplet_df['neg_product_id'].apply(lambda x: {x}))==False]
-    triplet_df['d_price'] = triplet_df['pos_price'] - triplet_df['neg_price']
-    triplet_df = triplet_df.drop(['pos_price','neg_price','pos_hotel_set','1'],axis=1)
+    triplet_df = triplet_df.drop(['pos_hotel_set','1'],axis=1)
     ineq_df.append(triplet_df)
     sys.stdout.write('\r %d' % b)
     sys.stdout.flush()
@@ -58,8 +59,8 @@ train_users = set(ineq_df['consumer_id'])
 val_df = ineq_df.loc[(ineq_df['val']==True) & ineq_df['consumer_id'].apply(lambda x: x in train_users),:]
 
 # create stdized version of observables
-observables = click_df.groupby('product_id')[['cat','colour']].first()
-for c in observables.columns:
+observables = click_df.groupby('product_id')[['cat','colour','price']].first()
+for c in ['cat','colour']:
     dummies = pd.get_dummies(observables[c],drop_first=True)
     for d in dummies.columns:
         observables['%s_%s' % (c.replace(' ','_'),str(d))] = dummies[d]
@@ -75,7 +76,7 @@ fullsteps = np.ceil(len(ineq_df)/float(batch_size))*1
 
 #initialize the samplers
 sampler = lambda df: bpr_triplet_impression_sampler(df,'consumer_id','pos_product_id','neg_product_id',
-        'd_price',batch_size=batch_size,shuffle=True)
+    batch_size=batch_size,shuffle=True)
 train_gen = sampler(train_df)
 val_gen = sampler(val_df)
 full_gen = sampler(ineq_df)
@@ -86,45 +87,46 @@ earlyend = EarlyStopping(patience=3,monitor='val_loss',mode='min')
 ##################################
 ####estimate model without observables (but includes price)
 dim = 5  # number of latent parameters (L in paper)
-pen = 1e0  # penalty term (lambda_theta in paper)
+pen = 1e1  # penalty term (lambda_theta in paper)
 pen_normed = pen/(num_consumers*(dim+1) + num_products*(dim+1))
 
 # create model of unobservables
 K.clear_session()
 #tf.set_random_seed(9)
-lat_model = build_bpr_model(num_items = num_products,num_users = num_consumers,
-            k=dim, pen=pen_normed,  usebias=True)
-print(lat_model.summary())
-lat_model.compile('adam',loss='binary_crossentropy')
+lat_model_w_price = build_bpr_model(num_items = num_products,num_users = num_consumers,
+            k=dim, pen=pen_normed,  usebias=True,X = observables_stdized[['price']],include_price=False)
+print(lat_model_w_price.summary())
+lat_model_w_price.compile('adam',loss='binary_crossentropy')
 #train to determine num iterations
-fitobj = lat_model.fit_generator(train_gen,epochs=1000,steps_per_epoch=trainsteps,verbose=1,callbacks=[earlyend],
+fitobj = lat_model_w_price.fit_generator(train_gen,epochs=1000,steps_per_epoch=trainsteps,verbose=1,callbacks=[earlyend],
             validation_data=val_gen,validation_steps=valsteps,use_multiprocessing=False,workers=1,max_queue_size=10)
 
 #now run it on the full dataset
 num_opt_epochs = np.argmin(fitobj.history['val_loss'])+1
 K.clear_session()
-lat_model = build_bpr_model(num_items = num_products,num_users = num_consumers,
-    k=dim, pen=pen_normed,  usebias=True)
+lat_model = build_bpr_model(num_items = num_products,num_users = num_consumers,X = observables_stdized[['price']],
+    k=dim, pen=pen_normed,  usebias=True,include_price=False)
 lat_model.compile('adam',loss='binary_crossentropy')
 fitobj = lat_model.fit_generator(full_gen,epochs=num_opt_epochs,steps_per_epoch=fullsteps,verbose=2,use_multiprocessing=False,
     workers=1,max_queue_size=10)
 
+
 # export learned embeddings
-(user_lat_embeddings,clothing_lat_embeddings) = export_embeddings(lat_model,product_dict,consumer_dict,observables=None,usebias=True)
+(user_lat_embeddings,clothing_lat_embeddings) = export_embeddings(lat_model,product_dict,consumer_dict,observables=observables[['price']],usebias=True,include_price=False)
 clothing_lat_embeddings.to_csv("external/clothing_latent_embeddings_5d.tsv" ,sep='\t')
 user_lat_embeddings.to_csv("external/consumer_latent_embeddings_5d.tsv" ,sep='\t')
 
 
 ##################################
 ####estimate model with only observables
-pen = 1e-1 #penalty term (lambda_theta in text)
+pen = 1e1 #penalty term (lambda_theta in text)
 pen_normed = pen/(num_consumers*(observables.shape[1]+1))
 K.clear_session()
 np.random.seed(9)
 #create model
 obs_model = build_bpr_model(num_items = num_products,num_users = num_consumers,
-            k=0, pen=pen_normed,  usebias=True,X=observables_stdized)
-print(obs_model.summary())
+            k=0, pen=pen_normed,  usebias=True,X=observables_stdized,include_price=False)
+# print(obs_model.summary())
 obs_model.compile('adam',loss='binary_crossentropy')
 #train to determine num iterations
 fitobj = obs_model.fit_generator(train_gen,epochs=1000,steps_per_epoch=trainsteps,verbose=1,callbacks=[earlyend],
@@ -134,13 +136,29 @@ fitobj = obs_model.fit_generator(train_gen,epochs=1000,steps_per_epoch=trainstep
 K.clear_session()
 num_opt_epochs = np.argmin(fitobj.history['val_loss'])+1
 obs_model = build_bpr_model(num_items = num_products,num_users = num_consumers,
-                            k=0, pen=pen_normed, usebias=True, X=observables_stdized)
+                            k=0, pen=pen_normed, usebias=True, X=observables_stdized,include_price=False)
 obs_model.compile('adam',loss='binary_crossentropy')
 fitobj = obs_model.fit_generator(full_gen,epochs=num_opt_epochs,steps_per_epoch=fullsteps,verbose=2,use_multiprocessing=False,
     workers=1,max_queue_size=10)
 
 # export learned embeddings
-(user_obs_embeddings,clothing_obs_embeddings) = export_embeddings(obs_model,product_dict,consumer_dict,observables=observables,usebias=True)
+
+
+
+(user_obs_embeddings,clothing_obs_embeddings) = export_embeddings(obs_model,product_dict,consumer_dict,observables=observables,usebias=True,include_price=False)
+print(clothing_obs_embeddings.head())
 user_obs_embeddings.to_csv("external/consumer_obs_embeddings.tsv" ,sep='\t')
+
 #correlation structure of preferences
 print(user_obs_embeddings.corr())
+
+#plot embeddings learned from latent space, by category
+tsne_df = TSNE(random_state=9,perplexity=2,init='pca',method='exact').fit_transform(clothing_lat_embeddings.drop('bias',axis=1)) # .drop('bias',axis=1))
+tsne_df =  pd.DataFrame(tsne_df,index=clothing_lat_embeddings.index,columns = ['tsne_0','tsne_1'])
+cat_dict = {1:'trousers',2:'skirts',3:'blouses',4:'sale'}
+observables['cat_1'] = observables[[c for c in observables.columns if c.startswith('cat_')] ].sum()==0
+for c in cat_dict.keys():
+    bool = (observables['cat_%d' % c]==1).values
+    plt.scatter(tsne_df.loc[bool,'tsne_0'],tsne_df.loc[bool,'tsne_1'],label=cat_dict[c],alpha=.5)
+plt.legend()
+plt.show()
