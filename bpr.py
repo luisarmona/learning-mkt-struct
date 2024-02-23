@@ -122,7 +122,6 @@ def export_embeddings(model,product_dict,user_dict,observables=None,usebias=True
         user_lat_embeddings = pd.DataFrame(user_lat_embeddings, index=users, columns=lat_colnames)
     if has_observables:
         product_obs_embeddings = pd.DataFrame(observables.values, index=products,columns=observables.columns)
-        print(product_obs_embeddings)
         user_obs_embeddings = model.get_layer('user_obs_embeddings').get_weights()[0]
         user_obs_embeddings = pd.DataFrame(user_obs_embeddings, index=users, columns=observables.columns)
         # unstandardize observable embeddings so works with the magnitude of original observables
